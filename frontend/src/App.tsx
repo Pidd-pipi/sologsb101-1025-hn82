@@ -158,7 +158,8 @@ export default function App() {
         </Content>
 
         <Footer style={{ textAlign: 'center', background: 'transparent', color: 'rgba(74,44,23,0.55)' }}>
-          纯前端 SPA · 数据仅保存在本机浏览器 IndexedDB（库名 gbroastlog，结构版本 2）·
+          纯前端 SPA · 数据仅保存在本机浏览器 IndexedDB（库名 gbroastlog，结构版本 3）·
+          烘焙间与门店档案离线各改，回店在「拼配方案」页导入档案逐条合并（冲突留候选、容量不足留草稿）·
           <Link to={ROUTES.beans} style={{ marginLeft: 6 }}>
             返回生豆档案
           </Link>

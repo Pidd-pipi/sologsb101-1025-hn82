@@ -14,6 +14,7 @@ import {
   removeGreenBean,
   type StockConsumeResult,
 } from '../utils/db';
+import { nextRevForTable } from '../utils/revision';
 import type { RootState } from './store';
 
 export type StockLevel = 'ok' | 'low' | 'empty';
@@ -55,7 +56,8 @@ export const fetchGreenBeans = createAsyncThunk('beans/fetchAll', async () => li
 
 export const createGreenBean = createAsyncThunk('beans/create', async (draft: GreenBeanDraft) => {
   const stamp = nowIso();
-  const row: GreenBean = { ...draft, id: createId('gb'), createdAt: stamp, updatedAt: stamp };
+  const rev = nextRevForTable('greenBeans', draft as unknown as Record<string, unknown>, 0);
+  const row: GreenBean = { ...draft, id: createId('gb'), rev, createdAt: stamp, updatedAt: stamp };
   await putGreenBean(row);
   return listGreenBeans();
 });
@@ -63,10 +65,21 @@ export const createGreenBean = createAsyncThunk('beans/create', async (draft: Gr
 export const updateGreenBean = createAsyncThunk(
   'beans/update',
   async (input: { id: string; draft: GreenBeanDraft }) => {
-    const stamp = nowIso();
-    const row: GreenBean = { ...input.draft, id: input.id, createdAt: stamp, updatedAt: stamp };
     const existing = (await listGreenBeans()).find((bean) => bean.id === input.id);
-    await putGreenBean({ ...row, createdAt: existing ? existing.createdAt : stamp });
+    const stamp = nowIso();
+    const rev = nextRevForTable(
+      'greenBeans',
+      input.draft as unknown as Record<string, unknown>,
+      existing?.rev ?? 0,
+    );
+    const row: GreenBean = {
+      ...input.draft,
+      id: input.id,
+      rev,
+      createdAt: existing ? existing.createdAt : stamp,
+      updatedAt: stamp,
+    };
+    await putGreenBean(row);
     return listGreenBeans();
   },
 );

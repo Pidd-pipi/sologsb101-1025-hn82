@@ -36,6 +36,7 @@ import {
 import dayjs, { type Dayjs } from 'dayjs';
 import FilterBar, { type FilterSelectConfig } from '../components/common/FilterBar';
 import EmptyPanel from '../components/common/EmptyPanel';
+import ConflictNotice from '../components/common/ConflictNotice';
 import ScoreTag from '../components/common/ScoreTag';
 import StatBadge from '../components/common/StatBadge';
 import { useRoastCurve } from '../hooks/useRoastCurve';
@@ -449,6 +450,7 @@ export default function CurveEntry() {
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <ConflictNotice />
       <FilterBar
         keyword={roastState.filters.keyword}
         onKeywordChange={(keyword) => dispatch(setRoastFilters({ keyword }))}

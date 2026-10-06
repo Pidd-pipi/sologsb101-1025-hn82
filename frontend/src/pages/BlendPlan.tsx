@@ -4,7 +4,7 @@
  * 交互：配方占比合计 100% 校验、参与批次杯测均分回显、目标风味登记、状态流转（试配 → 定版 → 停用）、
  *       方案 JSON 与整库档案 JSON 的导入导出（导入前做结构校验）。
  */
-import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
 import {
   App as AntdApp,
   Alert,
@@ -91,7 +91,9 @@ import {
   parseArchiveJson,
   parseBlendJson,
 } from '../utils/export';
-import { exportSnapshot, importSnapshot } from '../utils/db';
+import { exportSnapshot } from '../utils/db';
+import { mergeArchive, previewArchiveMerge, type MergeReport } from '../utils/merge';
+import MergeCenter from '../components/common/MergeCenter';
 import type { Blend } from '../types/blend';
 
 interface BlendFormValues {
@@ -321,6 +323,16 @@ export default function BlendPlan() {
     fileInputRef.current?.click();
   };
 
+  /** 合并落地后统一刷新各 slice（生豆余量 / 曲线 / 杯测 / 拼配均分都可能变） */
+  const refreshAll = useCallback(async (): Promise<void> => {
+    await Promise.all([
+      dispatch(fetchBlends()).unwrap(),
+      dispatch(fetchGreenBeans()).unwrap(),
+      dispatch(fetchRoastProfiles()).unwrap(),
+      dispatch(fetchCuppings()).unwrap(),
+    ]);
+  }, [dispatch]);
+
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>): Promise<void> => {
     const file = event.target.files?.[0];
     event.target.value = '';
@@ -335,28 +347,48 @@ export default function BlendPlan() {
     }
 
     if (mode === 'archive') {
+      let snapshot;
       try {
-        const snapshot = parseArchiveJson(text);
-        modal.confirm({
-          title: '导入整库档案并覆盖现有数据？',
-          content: `档案包含：生豆 ${snapshot.greenBeans.length} 批 / 烘焙记录 ${snapshot.roastProfiles.length} 次 / 曲线事件 ${snapshot.events.length} 个 / 杯测 ${snapshot.cuppings.length} 笔 / 拼配 ${snapshot.blends.length} 个。导入会先清空当前本地库。`,
-          okText: '覆盖导入',
-          okButtonProps: { danger: true },
-          cancelText: '取消',
-          async onOk() {
-            await importSnapshot(snapshot);
-            await Promise.all([
-              dispatch(fetchBlends()).unwrap(),
-              dispatch(fetchGreenBeans()).unwrap(),
-              dispatch(fetchRoastProfiles()).unwrap(),
-              dispatch(fetchCuppings()).unwrap(),
-            ]);
-            message.success('整库档案已导入');
-          },
-        });
+        snapshot = parseArchiveJson(text);
       } catch (error) {
         message.error(describeError(error));
+        return;
       }
+      let preview: Awaited<ReturnType<typeof previewArchiveMerge>> | null = null;
+      try {
+        preview = await previewArchiveMerge(snapshot);
+      } catch (error) {
+        message.error(describeError(error));
+        return;
+      }
+      const shortageLines = preview.shortages
+        .map((item) => `${item.origin}${item.farm ? ` · ${item.farm}` : ''} 缺 ${item.shortKg}kg`)
+        .join('；');
+      modal.confirm({
+        title: '逐条合并整库档案（不会覆盖本地）？',
+        content: `档案包含：生豆 ${snapshot.greenBeans.length} 批 / 烘焙记录 ${snapshot.roastProfiles.length} 次 / 曲线事件 ${snapshot.events.length} 个 / 杯测 ${snapshot.cuppings.length} 笔 / 拼配 ${snapshot.blends.length} 个。同一条先比修订号再比时间，两边都改过会并存为候选；仅一边有的直接补入。${
+          preview.shortages.length > 0
+            ? `\n\n预检发现生豆余量不足（${shortageLines}），本次入库将被拒绝并存为重试草稿。`
+            : ''
+        }${preview.openConflicts > 0 ? `\n\n预计产生 ${preview.openConflicts} 条冲突候选，合并后可在合并中心裁决。` : ''}`,
+        okText: preview.shortages.length > 0 ? '预检并存草稿' : '确认合并',
+        cancelText: '取消',
+        async onOk() {
+          let report: MergeReport;
+          try {
+            report = await mergeArchive(snapshot);
+          } catch (error) {
+            message.error(describeError(error));
+            return;
+          }
+          await refreshAll();
+          if (report.ok) {
+            message.success(report.message);
+          } else {
+            message.warning(report.message);
+          }
+        },
+      });
       return;
     }
 
@@ -397,7 +429,12 @@ export default function BlendPlan() {
       width: 330,
       render: (_value, row) => (
         <Space direction="vertical" size={2}>
-          <Typography.Text strong>{row.name}</Typography.Text>
+          <Space size={6}>
+            <Typography.Text strong>{row.name}</Typography.Text>
+            <Tag className="gb-muted" style={{ fontSize: 11 }}>
+              rev {row.rev}
+            </Tag>
+          </Space>
           <span className="gb-muted">{itemSummary(row)}</span>
         </Space>
       ),
@@ -525,9 +562,11 @@ export default function BlendPlan() {
             <Button icon={<ExportOutlined />} onClick={() => void handleExportArchive()}>
               导出档案
             </Button>
-            <Button icon={<ImportOutlined />} onClick={() => triggerImport('archive')}>
-              导入档案
-            </Button>
+            <Tooltip title="逐条合并：同条先比修订号再比时间，两边都改过留两个候选；容量不足会存为重试草稿，不覆盖本地">
+              <Button icon={<ImportOutlined />} onClick={() => triggerImport('archive')}>
+                回店合并档案
+              </Button>
+            </Tooltip>
             <Button icon={<ImportOutlined />} onClick={() => triggerImport('blend')}>
               导入方案
             </Button>
@@ -537,6 +576,8 @@ export default function BlendPlan() {
           </Space>
         }
       />
+
+      <MergeCenter onChanged={() => void refreshAll()} />
 
       <Card title="拼配方案与结构版本" styles={{ body: { paddingTop: 12 } }}>
         <div className="gb-stat-row">

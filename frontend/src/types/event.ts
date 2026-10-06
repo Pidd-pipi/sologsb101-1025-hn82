@@ -19,6 +19,11 @@ export interface RoastEvent {
   rorPerMin: number;
   /** 备注 */
   note: string;
+  /** 修订号：按所属烘焙记录的烘焙日期回填，每次编辑 +1 */
+  rev: number;
+  /** 合并冲突候选标记（主记录不带） */
+  conflictOf?: string;
+  conflictSide?: 'incoming' | 'local';
   createdAt: string;
   updatedAt: string;
 }
@@ -26,7 +31,7 @@ export interface RoastEvent {
 /** 数据模型别名：Event 曲线事件 */
 export type Event = RoastEvent;
 
-export type RoastEventDraft = Omit<RoastEvent, 'id' | 'createdAt' | 'updatedAt'>;
+export type RoastEventDraft = Omit<RoastEvent, 'id' | 'createdAt' | 'updatedAt' | 'rev' | 'conflictOf' | 'conflictSide'>;
 
 export const EVENT_TYPE_LABEL: Record<RoastEventType, string> = {
   turning: '回温',

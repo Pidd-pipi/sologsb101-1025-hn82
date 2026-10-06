@@ -1,7 +1,8 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据库名 gbroastlog，数据结构版本号 DB_VERSION = 2（version(1) 初版 + version(2) 真实迁移）
- * - 生豆 / 烘焙记录 / 曲线事件 / 杯测 / 拼配方案 分表存储（另有载量模板表）
+ * - 数据库名 gbroastlog，数据结构版本号 DB_VERSION = 3
+ *   version(1) 初版 → version(2) 时间戳/模板/派生值迁移 → version(3) 离线合并：rev 修订号 + 冲突候选 + 入库重试草稿表
+ * - 生豆 / 烘焙记录 / 曲线事件 / 杯测 / 拼配方案 分表存储（另有载量模板表、合并草稿表）
  * - 首屏自动播种演示数据（父→子→孙三层贯通，幂等）
  * - 整库快照导出导入、级联删除、下豆扣减生豆在库重量
  * 纯前端应用：不依赖任何后端或数据库服务。
@@ -15,13 +16,16 @@ import type { RoastEvent } from '../types/event';
 import type { Cupping } from '../types/cupping';
 import { weightedTotalScore } from '../types/cupping';
 import type { Blend } from '../types/blend';
+import type { MergeDraft, SyncTableName } from '../types/sync';
+import { conflictCandidateId } from '../types/sync';
+import { ensureRev, nextRevForTable } from './revision';
 import { rorPerMinBetween } from './curve';
 
 /** 数据库名（= 项目英文短名） */
 export const DB_NAME = 'gbroastlog';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 class RoastLogDatabase extends Dexie {
   greenBeans!: Table<GreenBean, string>;
@@ -30,6 +34,7 @@ class RoastLogDatabase extends Dexie {
   cuppings!: Table<Cupping, string>;
   blends!: Table<Blend, string>;
   machineTemplates!: Table<MachineTemplate, string>;
+  mergeDrafts!: Table<MergeDraft, string>;
 
   constructor() {
     super(DB_NAME);
@@ -44,7 +49,7 @@ class RoastLogDatabase extends Dexie {
     });
 
     // v2：补齐 createdAt/updatedAt 索引；新增载量模板表；按时间顺序补算历史 RoR 与杯测总分
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         greenBeans: 'id, origin, process, arrivedAt, createdAt, updatedAt',
         roastProfiles: 'id, greenBeanId, machineModel, roastedAt, state, updatedAt',
@@ -136,6 +141,44 @@ class RoastLogDatabase extends Dexie {
           if (typeof row.targetFlavor !== 'string') row.targetFlavor = '';
         });
       });
+
+    // v3：离线逐条合并——各表加 rev 修订号与 conflictOf 候选索引，新增入库重试草稿表；
+    // 旧数据没有修订号时按烘焙日期（生豆按到货、杯测按杯测日期…）回填后再参与合并。
+    this.version(DB_VERSION)
+      .stores({
+        greenBeans: 'id, origin, process, arrivedAt, createdAt, updatedAt, rev, conflictOf',
+        roastProfiles: 'id, greenBeanId, machineModel, roastedAt, state, updatedAt, rev, conflictOf',
+        events: 'id, profileId, type, atSec, createdAt, updatedAt, rev, conflictOf',
+        cuppings: 'id, profileId, cuppedAt, totalScore, updatedAt, rev, conflictOf',
+        blends: 'id, name, state, createdAt, updatedAt, rev, conflictOf',
+        machineTemplates: 'id, model, chargeG, gasLevel, rev, conflictOf',
+        mergeDrafts: 'id, createdAt, lastTriedAt',
+      })
+      .upgrade(async (tx) => {
+        // 事件按所属烘焙记录的烘焙日期回填修订号
+        const profiles = (await tx.table('roastProfiles').toArray()) as Array<Record<string, unknown>>;
+        const profileDateMap = new Map<string, string>();
+        profiles.forEach((row) => {
+          if (typeof row.id === 'string' && typeof row.roastedAt === 'string') {
+            profileDateMap.set(row.id, row.roastedAt);
+          }
+        });
+
+        const revTables: SyncTableName[] = [
+          'greenBeans',
+          'roastProfiles',
+          'events',
+          'cuppings',
+          'blends',
+          'machineTemplates',
+        ];
+        for (const name of revTables) {
+          const rows = (await tx.table(name).toArray()) as Array<Record<string, unknown>>;
+          if (rows.length === 0) continue;
+          const backfilled = rows.map((row) => ensureRev(name, row, profileDateMap));
+          await tx.table(name).bulkPut(backfilled);
+        }
+      });
   }
 }
 
@@ -161,7 +204,7 @@ export function roundKg(value: number): number {
 /* --------------------------- 生豆 GreenBean --------------------------- */
 
 export async function listGreenBeans(): Promise<GreenBean[]> {
-  const rows = await db.greenBeans.toArray();
+  const rows = (await db.greenBeans.toArray()).filter((row) => !row.conflictOf);
   return rows.sort((a, b) => b.arrivedAt.localeCompare(a.arrivedAt) || a.origin.localeCompare(b.origin, 'zh-Hans-CN'));
 }
 
@@ -173,7 +216,7 @@ export async function putGreenBean(row: GreenBean): Promise<void> {
   await db.greenBeans.put(row);
 }
 
-/** 删除生豆：级联删除其烘焙记录、曲线事件、杯测，并从拼配配方中摘除相关成分 */
+/** 删除生豆：级联删除其烘焙记录、曲线事件、杯测与对应冲突候选，并从拼配配方中摘除相关成分 */
 export async function removeGreenBean(id: string): Promise<void> {
   await db.transaction('rw', db.greenBeans, db.roastProfiles, db.events, db.cuppings, db.blends, async () => {
     const profiles = await db.roastProfiles.where('greenBeanId').equals(id).toArray();
@@ -182,24 +225,37 @@ export async function removeGreenBean(id: string): Promise<void> {
       await db.events.where('profileId').anyOf(profileIds).delete();
       await db.cuppings.where('profileId').anyOf(profileIds).delete();
       await db.roastProfiles.bulkDelete(profileIds);
+      // 清理这些烘焙记录的冲突候选
+      const profileCandidates = (await db.roastProfiles.toArray())
+        .filter((row) => typeof row.conflictOf === 'string' && profileIds.includes(row.conflictOf))
+        .map((row) => row.id);
+      if (profileCandidates.length > 0) await db.roastProfiles.bulkDelete(profileCandidates);
     }
     const blends = await db.blends.toArray();
     const stamp = nowIso();
     const affected = blends
       .map((blend) => {
         const items = blend.items.filter((item) => item.greenBeanId !== id && !profileIds.includes(item.profileId));
-        return items.length === blend.items.length ? null : { ...blend, items, updatedAt: stamp };
+        if (items.length === blend.items.length) return null;
+        return {
+          ...blend,
+          items,
+          rev: nextRevForTable('blends', { ...blend, items }, blend.rev),
+          updatedAt: stamp,
+        };
       })
       .filter((blend): blend is Blend => blend !== null);
     if (affected.length > 0) await db.blends.bulkPut(affected);
     await db.greenBeans.delete(id);
+    const beanCandidates = await db.greenBeans.where('conflictOf').equals(id).primaryKeys();
+    if (beanCandidates.length > 0) await db.greenBeans.bulkDelete(beanCandidates as string[]);
   });
 }
 
 /* ------------------------ 烘焙记录 RoastProfile ------------------------ */
 
 export async function listRoastProfiles(): Promise<RoastProfile[]> {
-  const rows = await db.roastProfiles.toArray();
+  const rows = (await db.roastProfiles.toArray()).filter((row) => !row.conflictOf);
   return rows.sort((a, b) => b.roastedAt.localeCompare(a.roastedAt));
 }
 
@@ -211,7 +267,7 @@ export async function putRoastProfile(row: RoastProfile): Promise<void> {
   await db.roastProfiles.put(row);
 }
 
-/** 删除烘焙记录：级联删除曲线事件与杯测，并从拼配配方中摘除相关成分 */
+/** 删除烘焙记录：级联删除曲线事件、杯测与冲突候选，并从拼配配方中摘除相关成分 */
 export async function removeRoastProfile(id: string): Promise<void> {
   await db.transaction('rw', db.roastProfiles, db.events, db.cuppings, db.blends, async () => {
     await db.events.where('profileId').equals(id).delete();
@@ -221,30 +277,52 @@ export async function removeRoastProfile(id: string): Promise<void> {
     const affected = blends
       .map((blend) => {
         const items = blend.items.filter((item) => item.profileId !== id);
-        return items.length === blend.items.length ? null : { ...blend, items, updatedAt: stamp };
+        if (items.length === blend.items.length) return null;
+        return {
+          ...blend,
+          items,
+          rev: nextRevForTable('blends', { ...blend, items }, blend.rev),
+          updatedAt: stamp,
+        };
       })
       .filter((blend): blend is Blend => blend !== null);
     if (affected.length > 0) await db.blends.bulkPut(affected);
     await db.roastProfiles.delete(id);
+    const candidateKeys = await db.roastProfiles.where('conflictOf').equals(id).primaryKeys();
+    if (candidateKeys.length > 0) await db.roastProfiles.bulkDelete(candidateKeys as string[]);
   });
 }
 
-/** 状态流转：记录中 → 已完成 / 作废 */
+/** 状态流转：记录中 → 已完成 / 作废（状态变化也是一次修订，rev +1） */
 export async function updateRoastState(id: string, state: RoastState): Promise<void> {
-  await db.roastProfiles.update(id, { state, updatedAt: nowIso() });
+  const existing = await db.roastProfiles.get(id);
+  const stamp = nowIso();
+  if (!existing) {
+    await db.roastProfiles.update(id, { state, updatedAt: stamp });
+    return;
+  }
+  const next: RoastProfile = {
+    ...existing,
+    state,
+    updatedAt: stamp,
+    rev: nextRevForTable('roastProfiles', { ...existing, state }, existing.rev),
+  };
+  await db.roastProfiles.put(next);
 }
 
 /* --------------------------- 曲线事件 RoastEvent --------------------------- */
 
 export async function listEvents(profileId?: string): Promise<RoastEvent[]> {
-  const rows = profileId
-    ? await db.events.where('profileId').equals(profileId).toArray()
-    : await db.events.toArray();
+  const rows = (
+    profileId
+      ? await db.events.where('profileId').equals(profileId).toArray()
+      : await db.events.toArray()
+  ).filter((row) => !row.conflictOf);
   return rows.sort((a, b) => a.atSec - b.atSec);
 }
 
 export async function listAllEvents(): Promise<RoastEvent[]> {
-  return db.events.toArray();
+  return (await db.events.toArray()).filter((row) => !row.conflictOf);
 }
 
 export async function putEvent(row: RoastEvent): Promise<void> {
@@ -262,7 +340,7 @@ export async function removeEvent(id: string): Promise<void> {
 /* ----------------------------- 杯测 Cupping ----------------------------- */
 
 export async function listCuppings(): Promise<Cupping[]> {
-  const rows = await db.cuppings.toArray();
+  const rows = (await db.cuppings.toArray()).filter((row) => !row.conflictOf);
   return rows.sort((a, b) => b.cuppedAt.localeCompare(a.cuppedAt));
 }
 
@@ -277,7 +355,7 @@ export async function removeCupping(id: string): Promise<void> {
 /* ------------------------------ 拼配 Blend ------------------------------ */
 
 export async function listBlends(): Promise<Blend[]> {
-  const rows = await db.blends.toArray();
+  const rows = (await db.blends.toArray()).filter((row) => !row.conflictOf);
   return rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
@@ -292,7 +370,7 @@ export async function removeBlend(id: string): Promise<void> {
 /* -------------------------- 载量模板 MachineTemplate -------------------------- */
 
 export async function listMachineTemplates(): Promise<MachineTemplate[]> {
-  const rows = await db.machineTemplates.toArray();
+  const rows = (await db.machineTemplates.toArray()).filter((row) => !row.conflictOf);
   return rows.sort((a, b) => a.model.localeCompare(b.model, 'zh-Hans-CN') || a.chargeG - b.chargeG);
 }
 
@@ -334,6 +412,17 @@ export async function consumeStockForProfile(profileId: string): Promise<StockCo
       return { ok: false, message: '该烘焙记录关联的生豆已不存在', deductedKg: 0, remainingKg: 0, warning: false };
     }
     const deductedKg = roundKg(profile.chargeG / 1000);
+    if (profile.conflictOf) {
+      return {
+        ok: false,
+        message: '该记录是待裁决的合并冲突候选，请先在合并中心选定保留版本后再下豆',
+        deductedKg: 0,
+        remainingKg: bean.stockKg,
+        warning: false,
+        bean,
+        profile,
+      };
+    }
     if (profile.state !== 'recording') {
       return {
         ok: false,
@@ -358,8 +447,18 @@ export async function consumeStockForProfile(profileId: string): Promise<StockCo
     }
     const stamp = nowIso();
     const remainingKg = roundKg(bean.stockKg - deductedKg);
-    const nextBean: GreenBean = { ...bean, stockKg: remainingKg, updatedAt: stamp };
-    const nextProfile: RoastProfile = { ...profile, state: 'done', updatedAt: stamp };
+    const nextBean: GreenBean = {
+      ...bean,
+      stockKg: remainingKg,
+      rev: nextRevForTable('greenBeans', { ...bean, stockKg: remainingKg }, bean.rev),
+      updatedAt: stamp,
+    };
+    const nextProfile: RoastProfile = {
+      ...profile,
+      state: 'done',
+      rev: nextRevForTable('roastProfiles', { ...profile, state: 'done' }, profile.rev),
+      updatedAt: stamp,
+    };
     await db.greenBeans.put(nextBean);
     await db.roastProfiles.put(nextProfile);
     const warning = remainingKg < LOW_STOCK_KG;
@@ -389,6 +488,8 @@ export interface DatabaseSnapshot {
   cuppings: Cupping[];
   blends: Blend[];
   machineTemplates: MachineTemplate[];
+  /** 容量不足被拒后留待重试的入库草稿（门店端导出时随档带走） */
+  mergeDrafts?: MergeDraft[];
 }
 
 /** 结构校验：判断任意对象是否为可导入的快照 */
@@ -406,13 +507,14 @@ export function isDatabaseSnapshot(value: unknown): value is DatabaseSnapshot {
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [greenBeans, roastProfiles, events, cuppings, blends, machineTemplates] = await Promise.all([
+  const [greenBeans, roastProfiles, events, cuppings, blends, machineTemplates, mergeDrafts] = await Promise.all([
     db.greenBeans.toArray(),
     db.roastProfiles.toArray(),
     db.events.toArray(),
     db.cuppings.toArray(),
     db.blends.toArray(),
     db.machineTemplates.toArray(),
+    db.mergeDrafts.toArray(),
   ]);
   return {
     name: DB_NAME,
@@ -424,17 +526,18 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     cuppings,
     blends,
     machineTemplates,
+    mergeDrafts,
   };
 }
 
-/** 用快照覆盖整库（导入档案） */
+/** 用快照覆盖整库（旧的「覆盖导入」，保留供清空重建使用；跨店合并请用 utils/merge.ts） */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   if (!isDatabaseSnapshot(snapshot)) {
     throw new Error('档案结构不合法：缺少 greenBeans / roastProfiles / events / cuppings / blends 数组字段');
   }
   await db.transaction(
     'rw',
-    [db.greenBeans, db.roastProfiles, db.events, db.cuppings, db.blends, db.machineTemplates],
+    [db.greenBeans, db.roastProfiles, db.events, db.cuppings, db.blends, db.machineTemplates, db.mergeDrafts],
     async () => {
       await Promise.all([
         db.greenBeans.clear(),
@@ -443,6 +546,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.cuppings.clear(),
         db.blends.clear(),
         db.machineTemplates.clear(),
+        db.mergeDrafts.clear(),
       ]);
       await db.greenBeans.bulkPut(snapshot.greenBeans);
       await db.roastProfiles.bulkPut(snapshot.roastProfiles);
@@ -450,11 +554,12 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.cuppings.bulkPut(snapshot.cuppings);
       await db.blends.bulkPut(snapshot.blends);
       await db.machineTemplates.bulkPut(snapshot.machineTemplates ?? []);
+      // 覆盖导入是「整库重建」，不接收对端的重试草稿，避免把别处的未完成入库带进来
     },
   );
 }
 
-/** 清空全部表 */
+/** 清空全部表（保留库结构与合并草稿，草稿跨清库仍可重试） */
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
@@ -472,23 +577,24 @@ export async function clearAllTables(): Promise<void> {
   );
 }
 
-/** 重置为演示数据 */
-export async function resetDatabase(): Promise<void> {
-  await clearAllTables();
-  await seedDatabase();
-}
-
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [greenBeans, roastProfiles, events, cuppings, blends, machineTemplates] = await Promise.all([
+  const [greenBeans, roastProfiles, events, cuppings, blends, machineTemplates, mergeDrafts] = await Promise.all([
     db.greenBeans.count(),
     db.roastProfiles.count(),
     db.events.count(),
     db.cuppings.count(),
     db.blends.count(),
     db.machineTemplates.count(),
+    db.mergeDrafts.count(),
   ]);
-  return { greenBeans, roastProfiles, events, cuppings, blends, machineTemplates };
+  return { greenBeans, roastProfiles, events, cuppings, blends, machineTemplates, mergeDrafts };
+}
+
+/** 重置为演示数据 */
+export async function resetDatabase(): Promise<void> {
+  await clearAllTables();
+  await seedDatabase();
 }
 
 /* ------------------------------ 首屏初始化 ------------------------------ */
@@ -516,7 +622,7 @@ export async function seedDatabase(): Promise<void> {
     return base.toISOString().slice(0, 10);
   };
 
-  const greenBeans: GreenBean[] = [
+  const greenBeans: Array<Omit<GreenBean, 'rev'>> = [
     {
       id: 'gb-guji-washed',
       origin: '埃塞俄比亚 古吉',
@@ -567,7 +673,7 @@ export async function seedDatabase(): Promise<void> {
     },
   ];
 
-  const roastProfiles: RoastProfile[] = [
+  const roastProfiles: Array<Omit<RoastProfile, 'rev'>> = [
     {
       id: 'rp-guji-500',
       greenBeanId: 'gb-guji-washed',
@@ -640,7 +746,7 @@ export async function seedDatabase(): Promise<void> {
     ['ev-nyeri-2', 'rp-nyeri-400', 'dryEnd', 372, 131.8, '脱水期过长、RoR 偏低，判定作废重烘'],
   ];
 
-  const events: RoastEvent[] = eventSeed.map(([id, profileId, type, atSec, beanTempC, note]) => ({
+  const events: Array<Omit<RoastEvent, 'rev'>> = eventSeed.map(([id, profileId, type, atSec, beanTempC, note]) => ({
     id,
     profileId,
     type,
@@ -652,7 +758,7 @@ export async function seedDatabase(): Promise<void> {
     updatedAt: stamp,
   }));
   // 按时间顺序补算 RoR（播种后就带上真实速率，页面直接可用）
-  const grouped = new Map<string, RoastEvent[]>();
+  const grouped = new Map<RoastEvent['profileId'], Array<Omit<RoastEvent, 'rev'>>>();
   events.forEach((event) => {
     const list = grouped.get(event.profileId) ?? [];
     list.push(event);
@@ -677,7 +783,7 @@ export async function seedDatabase(): Promise<void> {
     acidity: number,
     sweetness: number,
     aftertaste: number,
-  ): Cupping => ({
+  ): Omit<Cupping, 'rev'> => ({
     id,
     profileId,
     cuppedAt,
@@ -691,13 +797,13 @@ export async function seedDatabase(): Promise<void> {
     updatedAt: stamp,
   });
 
-  const cuppings: Cupping[] = [
+  const cuppings: Array<Omit<Cupping, 'rev'>> = [
     buildCupping('cp-guji-01', 'rp-guji-500', day(4), 8.5, 8.8, 8.6, 8.9, 8.4),
     buildCupping('cp-cerrado-01', 'rp-cerrado-1200', day(12), 8.2, 8.4, 7.8, 8.8, 8.6),
     buildCupping('cp-huila-01', 'rp-huila-800', day(9), 7.9, 8.1, 7.4, 8.2, 7.8),
   ];
 
-  const blends: Blend[] = [
+  const blends: Array<Omit<Blend, 'rev'>> = [
     {
       id: 'bl-house-01',
       name: '晨光拼配 House Blend',
@@ -737,7 +843,7 @@ export async function seedDatabase(): Promise<void> {
     },
   ];
 
-  const machineTemplates: MachineTemplate[] = [
+  const machineTemplates: Array<Omit<MachineTemplate, 'rev'>> = [
     {
       id: 'mt-hb-m6',
       model: 'HB-M6',
@@ -780,16 +886,103 @@ export async function seedDatabase(): Promise<void> {
     },
   ];
 
+  // 按业务日期回填修订号（生豆到货 / 烘焙 / 杯测 / 创建日期），事件跟随所属烘焙记录
+  const profileDateMap = new Map(roastProfiles.map((profile) => [profile.id, profile.roastedAt]));
+  const seedGreenBeans: GreenBean[] = greenBeans.map((row) => ensureRev('greenBeans', row, profileDateMap));
+  const seedRoastProfiles: RoastProfile[] = roastProfiles.map((row) =>
+    ensureRev('roastProfiles', row, profileDateMap),
+  );
+  const seedEvents: RoastEvent[] = events.map((row) => ensureRev('events', row, profileDateMap));
+  const seedCuppings: Cupping[] = cuppings.map((row) => ensureRev('cuppings', row, profileDateMap));
+  const seedBlends: Blend[] = blends.map((row) => ensureRev('blends', row, profileDateMap));
+  const seedMachineTemplates: MachineTemplate[] = machineTemplates.map((row) =>
+    ensureRev('machineTemplates', row, profileDateMap),
+  );
+
   await db.transaction(
     'rw',
     [db.greenBeans, db.roastProfiles, db.events, db.cuppings, db.blends, db.machineTemplates],
     async () => {
-      await db.greenBeans.bulkPut(greenBeans);
-      await db.roastProfiles.bulkPut(roastProfiles);
-      await db.events.bulkPut(events);
-      await db.cuppings.bulkPut(cuppings);
-      await db.blends.bulkPut(blends);
-      await db.machineTemplates.bulkPut(machineTemplates);
+      await db.greenBeans.bulkPut(seedGreenBeans);
+      await db.roastProfiles.bulkPut(seedRoastProfiles);
+      await db.events.bulkPut(seedEvents);
+      await db.cuppings.bulkPut(seedCuppings);
+      await db.blends.bulkPut(seedBlends);
+      await db.machineTemplates.bulkPut(seedMachineTemplates);
     },
   );
+}
+
+/* --------------------------- 入库重试草稿（合并） --------------------------- */
+
+/** 列出全部入库重试草稿，按创建时间倒序 */
+export async function listMergeDrafts(): Promise<MergeDraft[]> {
+  const rows = await db.mergeDrafts.toArray();
+  return rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export async function putMergeDraft(draft: MergeDraft): Promise<void> {
+  await db.mergeDrafts.put(draft);
+}
+
+export async function getMergeDraft(id: string): Promise<MergeDraft | undefined> {
+  return db.mergeDrafts.get(id);
+}
+
+export async function removeMergeDraft(id: string): Promise<void> {
+  await db.mergeDrafts.delete(id);
+}
+
+/* ----------------------------- 冲突候选裁决 ----------------------------- */
+
+/** 各表候选行裁决后回写：以选中候选覆盖主记录，删除同组其余候选，并推进一次修订号。
+ * 裁决烘焙记录时，子表（曲线事件 / 杯测）里归属被淘汰候选的孤儿候选一并清掉。 */
+export async function resolveConflict(
+  table: SyncTableName,
+  winner: Record<string, unknown>,
+): Promise<void> {
+  const baseId = typeof winner.conflictOf === 'string' ? winner.conflictOf : String(winner.id);
+  const dexieTable = db.table(table);
+  const all = (await dexieTable.toArray()) as Array<Record<string, unknown>>;
+  const group = all.filter((row) => {
+    if (typeof row.conflictOf === 'string') return row.conflictOf === baseId;
+    return String(row.id) === baseId;
+  });
+  const stamp = nowIso();
+  const currentRev = group.reduce((acc, row) => Math.max(acc, Number(row.rev) || 0), 0);
+  const resolved: Record<string, unknown> = {
+    ...winner,
+    id: baseId,
+    conflictOf: undefined,
+    conflictSide: undefined,
+    updatedAt: stamp,
+    rev: nextRevForTable(table, winner, currentRev),
+  };
+  delete resolved.conflictOf;
+  delete resolved.conflictSide;
+  const removeIds = group.map((row) => String(row.id)).filter((id) => id !== baseId);
+
+  if (table === 'roastProfiles') {
+    // 该记录下的事件/杯测候选跟随被淘汰的候选版本一起清除
+    const childTables = [db.events, db.cuppings] as unknown as Array<Table<Record<string, unknown>, string>>;
+    for (const child of childTables) {
+      const orphans = (await child.toArray()).filter((row) => {
+        if (typeof row.profileId !== 'string') return false;
+        return removeIds.includes(row.profileId) || row.profileId === String(resolved.id);
+      });
+      // 只删候选行；主行（无 conflictOf）即使 profileId 暂时指向候选 id 也保留，交由后续合并修正
+      const orphanIds = orphans
+        .filter((row) => typeof row.conflictOf === 'string')
+        .map((row) => String(row.id));
+      if (orphanIds.length > 0) await child.bulkDelete(orphanIds);
+    }
+  }
+
+  await dexieTable.bulkDelete(removeIds);
+  await dexieTable.put(resolved);
+}
+
+/** 通用候选 id 生成（与 merge 引擎保持一致） */
+export function candidateIdOf(table: SyncTableName, baseId: string, side: 'incoming' | 'local'): string {
+  return conflictCandidateId(table, baseId, side);
 }

@@ -34,6 +34,7 @@ import {
 import dayjs from 'dayjs';
 import FilterBar, { type FilterSelectConfig } from '../components/common/FilterBar';
 import EmptyPanel from '../components/common/EmptyPanel';
+import ConflictNotice from '../components/common/ConflictNotice';
 import StatBadge from '../components/common/StatBadge';
 import { useIdbTable } from '../hooks/useIdbTable';
 import { useAppDispatch, useAppSelector } from '../stores/store';
@@ -406,6 +407,7 @@ export default function MachineConfig() {
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <ConflictNotice />
       <FilterBar
         keyword={roastState.machineFilters.keyword}
         onKeywordChange={(keyword) => dispatch(setMachineFilters({ keyword }))}

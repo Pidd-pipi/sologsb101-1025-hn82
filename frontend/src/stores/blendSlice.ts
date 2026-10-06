@@ -14,6 +14,7 @@ import {
 } from '../types/blend';
 import { averageScore } from '../types/cupping';
 import { createId, listBlends, nowIso, putBlend, removeBlend } from '../utils/db';
+import { nextRevForTable } from '../utils/revision';
 import type { RootState } from './store';
 
 export type RatioFlag = 'valid' | 'invalid';
@@ -78,13 +79,17 @@ export const fetchBlends = createAsyncThunk('blends/fetchAll', async () => listB
 
 export const createBlend = createAsyncThunk('blends/create', async (draft: BlendDraftState) => {
   const stamp = nowIso();
-  const row: Blend = {
-    id: createId('bl'),
+  const rowData = {
     name: draft.name.trim(),
     items: draft.items.map((item) => ({ ...item, ratioPct: Math.round(item.ratioPct * 100) / 100 })),
     targetFlavor: joinFlavors(draft.targetFlavor),
     createdAt: draft.createdAt,
     state: draft.state,
+  };
+  const row: Blend = {
+    ...rowData,
+    id: createId('bl'),
+    rev: nextRevForTable('blends', rowData as unknown as Record<string, unknown>, 0),
     updatedAt: stamp,
   };
   await putBlend(row);
@@ -94,14 +99,19 @@ export const createBlend = createAsyncThunk('blends/create', async (draft: Blend
 export const updateBlend = createAsyncThunk(
   'blends/update',
   async (input: { id: string; draft: BlendDraftState }) => {
+    const existing = (await listBlends()).find((blend) => blend.id === input.id);
     const stamp = nowIso();
-    const row: Blend = {
-      id: input.id,
+    const rowData = {
       name: input.draft.name.trim(),
       items: input.draft.items.map((item) => ({ ...item, ratioPct: Math.round(item.ratioPct * 100) / 100 })),
       targetFlavor: joinFlavors(input.draft.targetFlavor),
       createdAt: input.draft.createdAt,
       state: input.draft.state,
+    };
+    const row: Blend = {
+      ...rowData,
+      id: input.id,
+      rev: nextRevForTable('blends', rowData as unknown as Record<string, unknown>, existing?.rev ?? 0),
       updatedAt: stamp,
     };
     await putBlend(row);
@@ -119,7 +129,16 @@ export const advanceBlendState = createAsyncThunk(
   async (input: { id: string; state: BlendState }) => {
     const existing = (await listBlends()).find((blend) => blend.id === input.id);
     if (existing) {
-      await putBlend({ ...existing, state: input.state, updatedAt: nowIso() });
+      await putBlend({
+        ...existing,
+        state: input.state,
+        rev: nextRevForTable(
+          'blends',
+          { ...existing, state: input.state } as unknown as Record<string, unknown>,
+          existing.rev,
+        ),
+        updatedAt: nowIso(),
+      });
     }
     return listBlends();
   },
@@ -128,7 +147,8 @@ export const advanceBlendState = createAsyncThunk(
 /** 导入单个方案 JSON（已通过 parseBlendJson 校验） */
 export const importBlendDraft = createAsyncThunk('blends/import', async (draft: BlendDraft) => {
   const stamp = nowIso();
-  const row: Blend = { ...draft, id: createId('bl'), updatedAt: stamp };
+  const rev = nextRevForTable('blends', draft as unknown as Record<string, unknown>, 0);
+  const row: Blend = { ...draft, id: createId('bl'), rev, updatedAt: stamp };
   await putBlend(row);
   return listBlends();
 });

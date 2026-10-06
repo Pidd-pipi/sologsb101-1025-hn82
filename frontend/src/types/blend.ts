@@ -25,10 +25,15 @@ export interface Blend {
   createdAt: string;
   /** 状态：试配 / 定版 / 停用 */
   state: BlendState;
+  /** 修订号：按创建日期回填，每次编辑 +1 */
+  rev: number;
+  /** 合并冲突候选标记（主记录不带） */
+  conflictOf?: string;
+  conflictSide?: 'incoming' | 'local';
   updatedAt: string;
 }
 
-export type BlendDraft = Omit<Blend, 'id' | 'updatedAt'>;
+export type BlendDraft = Omit<Blend, 'id' | 'updatedAt' | 'rev' | 'conflictOf' | 'conflictSide'>;
 
 export const BLEND_STATE_LABEL: Record<BlendState, string> = {
   trial: '试配',

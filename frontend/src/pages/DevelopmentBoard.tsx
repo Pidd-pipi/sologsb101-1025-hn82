@@ -19,6 +19,7 @@ import type { ColumnsType } from 'antd/es/table';
 import { AreaChartOutlined, DownloadOutlined, ExperimentOutlined, WarningOutlined } from '@ant-design/icons';
 import FilterBar, { type FilterSelectConfig } from '../components/common/FilterBar';
 import EmptyPanel from '../components/common/EmptyPanel';
+import ConflictNotice from '../components/common/ConflictNotice';
 import ScoreTag from '../components/common/ScoreTag';
 import StatBadge from '../components/common/StatBadge';
 import { useIdbTable } from '../hooks/useIdbTable';
@@ -292,6 +293,7 @@ export default function DevelopmentBoard() {
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <ConflictNotice />
       <FilterBar
         keyword={roastState.filters.keyword}
         onKeywordChange={(keyword) => dispatch(setRoastFilters({ keyword }))}

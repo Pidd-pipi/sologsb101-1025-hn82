@@ -17,6 +17,7 @@ import { ROAST_STATE_ORDER } from '../types/roastprofile';
 import type { GreenBean } from '../types/greenbean';
 import type { BeanProcess } from '../types/greenbean';
 import { createId, listCuppings, nowIso, putCupping, removeCupping } from '../utils/db';
+import { nextRevForTable } from '../utils/revision';
 import type { RootState } from './store';
 
 /** 分项草稿（跨页共享：杯测页表单 + 拼配页均分回显） */
@@ -85,16 +86,20 @@ export const fetchCuppings = createAsyncThunk('cuppings/fetchAll', async () => l
 
 export const createCupping = createAsyncThunk('cuppings/create', async (draft: CuppingDraftState) => {
   const stamp = nowIso();
-  const row: Cupping = {
-    id: createId('cp'),
-    profileId: draft.profileId,
-    cuppedAt: draft.cuppedAt,
+  const parts = {
     dryAroma: normalizePartScore(draft.dryAroma),
     wetAroma: normalizePartScore(draft.wetAroma),
     acidity: normalizePartScore(draft.acidity),
     sweetness: normalizePartScore(draft.sweetness),
     aftertaste: normalizePartScore(draft.aftertaste),
+  };
+  const row: Cupping = {
+    id: createId('cp'),
+    profileId: draft.profileId,
+    cuppedAt: draft.cuppedAt,
+    ...parts,
     totalScore: weightedTotalScore(draft),
+    rev: nextRevForTable('cuppings', { ...draft, ...parts } as unknown as Record<string, unknown>, 0),
     createdAt: stamp,
     updatedAt: stamp,
   };
@@ -107,16 +112,24 @@ export const updateCupping = createAsyncThunk(
   async (input: { id: string; draft: CuppingDraftState }) => {
     const existing = (await listCuppings()).find((cupping) => cupping.id === input.id);
     const stamp = nowIso();
-    const row: Cupping = {
-      id: input.id,
-      profileId: input.draft.profileId,
-      cuppedAt: input.draft.cuppedAt,
+    const parts = {
       dryAroma: normalizePartScore(input.draft.dryAroma),
       wetAroma: normalizePartScore(input.draft.wetAroma),
       acidity: normalizePartScore(input.draft.acidity),
       sweetness: normalizePartScore(input.draft.sweetness),
       aftertaste: normalizePartScore(input.draft.aftertaste),
+    };
+    const row: Cupping = {
+      id: input.id,
+      profileId: input.draft.profileId,
+      cuppedAt: input.draft.cuppedAt,
+      ...parts,
       totalScore: weightedTotalScore(input.draft),
+      rev: nextRevForTable(
+        'cuppings',
+        { ...input.draft, ...parts } as unknown as Record<string, unknown>,
+        existing?.rev ?? 0,
+      ),
       createdAt: existing ? existing.createdAt : stamp,
       updatedAt: stamp,
     };

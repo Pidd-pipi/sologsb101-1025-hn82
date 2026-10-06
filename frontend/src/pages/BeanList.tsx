@@ -33,6 +33,7 @@ import {
 import dayjs, { type Dayjs } from 'dayjs';
 import FilterBar, { type FilterSelectConfig } from '../components/common/FilterBar';
 import EmptyPanel from '../components/common/EmptyPanel';
+import ConflictNotice from '../components/common/ConflictNotice';
 import StatBadge from '../components/common/StatBadge';
 import { useAppDispatch, useAppSelector } from '../stores/store';
 import {
@@ -343,6 +344,7 @@ export default function BeanList() {
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <ConflictNotice />
       <FilterBar
         keyword={beanState.filters.keyword}
         onKeywordChange={(keyword) => dispatch(setBeanFilters({ keyword }))}

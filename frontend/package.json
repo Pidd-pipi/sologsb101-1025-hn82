@@ -8,7 +8,9 @@
     "dev": "vite --host --port 22825",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host --port 22825",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:merge": "esbuild scripts/test-merge.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/test-merge.mjs && node node_modules/.cache/test-merge.mjs",
+    "test:merge:db": "esbuild scripts/test-merge-db.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/test-merge-db.mjs && node node_modules/.cache/test-merge-db.mjs"
   },
   "dependencies": {
     "@ant-design/icons": "^5.5.1",
@@ -26,6 +28,7 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "fake-indexeddb": "^6.2.5",
     "typescript": "~5.6.3",
     "vite": "^5.4.11"
   }

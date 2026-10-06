@@ -20,12 +20,18 @@ export interface GreenBean {
   stockKg: number;
   /** 到货日期（YYYY-MM-DD） */
   arrivedAt: string;
+  /** 修订号：按到货日期回填，每次编辑 +1（离线合并时先比修订号再比时间） */
+  rev: number;
+  /** 合并冲突时：候选归属的原记录 id（主记录不带此字段） */
+  conflictOf?: string;
+  /** 候选来源：对端档案 / 本端 */
+  conflictSide?: 'incoming' | 'local';
   createdAt: string;
   updatedAt: string;
 }
 
 /** 新建/编辑生豆时的表单草稿 */
-export type GreenBeanDraft = Omit<GreenBean, 'id' | 'createdAt' | 'updatedAt'>;
+export type GreenBeanDraft = Omit<GreenBean, 'id' | 'createdAt' | 'updatedAt' | 'rev' | 'conflictOf' | 'conflictSide'>;
 
 export const BEAN_PROCESS_LABEL: Record<BeanProcess, string> = {
   washed: '水洗',

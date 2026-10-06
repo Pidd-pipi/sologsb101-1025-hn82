@@ -28,6 +28,7 @@ import { DeleteOutlined, DownloadOutlined, EditOutlined, ExperimentOutlined, Plu
 import dayjs, { type Dayjs } from 'dayjs';
 import FilterBar, { type FilterSelectConfig } from '../components/common/FilterBar';
 import EmptyPanel from '../components/common/EmptyPanel';
+import ConflictNotice from '../components/common/ConflictNotice';
 import ScoreTag from '../components/common/ScoreTag';
 import StatBadge from '../components/common/StatBadge';
 import { useAppDispatch, useAppSelector } from '../stores/store';
@@ -303,6 +304,7 @@ export default function CuppingBoard() {
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <ConflictNotice />
       <FilterBar
         keyword={cuppingState.filters.keyword}
         onKeywordChange={(keyword) => dispatch(setCuppingFilters({ keyword }))}

@@ -12,7 +12,6 @@ import {
   listMachineTemplates,
   listRoastProfiles,
   nowIso,
-  putEvent,
   putEvents,
   putMachineTemplate,
   putRoastProfile,
@@ -22,6 +21,8 @@ import {
   updateRoastState,
 } from '../utils/db';
 import { reassignAtSecByOrder, sortEventsByTime, type DevBand } from '../utils/curve';
+import { recomputeEventRors } from '../utils/derived';
+import { nextRevForTable } from '../utils/revision';
 import type { RootState } from './store';
 
 export type ChargeLevel = 'sample' | 'standard' | 'full';
@@ -95,7 +96,8 @@ export const fetchRoastProfiles = createAsyncThunk('roasts/fetchProfiles', async
 
 export const createRoastProfile = createAsyncThunk('roasts/createProfile', async (draft: RoastProfileDraft) => {
   const stamp = nowIso();
-  const row: RoastProfile = { ...draft, id: createId('rp'), createdAt: stamp, updatedAt: stamp };
+  const rev = nextRevForTable('roastProfiles', draft as unknown as Record<string, unknown>, 0);
+  const row: RoastProfile = { ...draft, id: createId('rp'), rev, createdAt: stamp, updatedAt: stamp };
   await putRoastProfile(row);
   return listRoastProfiles();
 });
@@ -106,9 +108,15 @@ export const updateRoastProfile = createAsyncThunk(
     const profiles = await listRoastProfiles();
     const existing = profiles.find((profile) => profile.id === input.id);
     const stamp = nowIso();
+    const rev = nextRevForTable(
+      'roastProfiles',
+      input.draft as unknown as Record<string, unknown>,
+      existing?.rev ?? 0,
+    );
     const row: RoastProfile = {
       ...input.draft,
       id: input.id,
+      rev,
       createdAt: existing ? existing.createdAt : stamp,
       updatedAt: stamp,
     };
@@ -152,13 +160,23 @@ export const saveEvent = createAsyncThunk<EventSaveResult, EventInput>(
   'roasts/saveEvent',
   async (input: EventInput) => {
     const stamp = nowIso();
+    const existingEvents = await listEvents(input.profileId);
+    const existing = input.id ? existingEvents.find((event) => event.id === input.id) : undefined;
+    const rev = nextRevForTable(
+      'events',
+      input.draft as unknown as Record<string, unknown>,
+      existing?.rev ?? 0,
+    );
     const row: RoastEvent = {
       ...input.draft,
       id: input.id ?? createId('ev'),
-      createdAt: input.createdAt ?? stamp,
+      rev,
+      createdAt: input.createdAt ?? existing?.createdAt ?? stamp,
       updatedAt: stamp,
     };
-    await putEvent(row);
+    // 保存后整条记录的分段 RoR 统一重算（相邻节点变化会影响前后两段）
+    const recalculated = recomputeEventRors([...existingEvents.filter((event) => event.id !== row.id), row]);
+    await putEvents(recalculated);
     const events = await listEvents(input.profileId);
     return { events, saved: row };
   },
@@ -166,10 +184,14 @@ export const saveEvent = createAsyncThunk<EventSaveResult, EventInput>(
 
 export const deleteEvent = createAsyncThunk(
   'roasts/deleteEvent',
-  async (input: { id: string; profileId: string }) => listEvents(input.profileId).then(async (rows) => {
+  async (input: { id: string; profileId: string }) => {
+    const rows = await listEvents(input.profileId);
     await removeEvent(input.id);
-    return rows.filter((row) => row.id !== input.id);
-  }),
+    // 删除节点后分段 RoR 也要重算（被删节点前后两段合并为一段）
+    const remaining = rows.filter((row) => row.id !== input.id);
+    await putEvents(recomputeEventRors(remaining));
+    return listEvents(input.profileId);
+  },
 );
 
 /**
@@ -181,8 +203,14 @@ export const commitEventOrder = createAsyncThunk<RoastEvent[], void, { state: Ro
   async (_arg, { getState }) => {
     const { draftEvents, currentProfileId } = getState().roasts;
     if (!currentProfileId || draftEvents.length === 0) return [];
-    const remapped = reassignAtSecByOrder(draftEvents).map((event) => ({ ...event, updatedAt: nowIso() }));
-    await putEvents(remapped);
+    const stamp = nowIso();
+    const remapped = reassignAtSecByOrder(draftEvents).map((event) => ({
+      ...event,
+      rev: nextRevForTable('events', event as unknown as Record<string, unknown>, event.rev ?? 0),
+      updatedAt: stamp,
+    }));
+    // 排序后相邻关系变化，分段 RoR 一并重算
+    await putEvents(recomputeEventRors(remapped));
     return listEvents(currentProfileId);
   },
 );
@@ -195,16 +223,22 @@ export const saveMachineTemplate = createAsyncThunk(
   'roasts/saveMachine',
   async (input: { id?: string; draft: MachineTemplateDraft }) => {
     const stamp = nowIso();
+    let createdAt = stamp;
+    let currentRev = 0;
+    if (input.id) {
+      const existing = (await listMachineTemplates()).find((item) => item.id === input.id);
+      if (existing) {
+        createdAt = existing.createdAt;
+        currentRev = existing.rev;
+      }
+    }
     const row: MachineTemplate = {
       ...input.draft,
       id: input.id ?? createId('mt'),
-      createdAt: stamp,
+      rev: nextRevForTable('machineTemplates', input.draft as unknown as Record<string, unknown>, currentRev),
+      createdAt,
       updatedAt: stamp,
     };
-    if (input.id) {
-      const existing = (await listMachineTemplates()).find((item) => item.id === input.id);
-      if (existing) row.createdAt = existing.createdAt;
-    }
     await putMachineTemplate(row);
     return listMachineTemplates();
   },

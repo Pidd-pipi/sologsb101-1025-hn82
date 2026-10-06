@@ -20,11 +20,19 @@ export interface Cupping {
   aftertaste: number;
   /** 加权总分 0-100 */
   totalScore: number;
+  /** 修订号：按杯测日期回填，每次编辑 +1 */
+  rev: number;
+  /** 合并冲突候选标记（主记录不带） */
+  conflictOf?: string;
+  conflictSide?: 'incoming' | 'local';
   createdAt: string;
   updatedAt: string;
 }
 
-export type CuppingDraft = Omit<Cupping, 'id' | 'totalScore' | 'createdAt' | 'updatedAt'>;
+export type CuppingDraft = Omit<
+  Cupping,
+  'id' | 'totalScore' | 'createdAt' | 'updatedAt' | 'rev' | 'conflictOf' | 'conflictSide'
+>;
 
 export type CuppingField = 'dryAroma' | 'wetAroma' | 'acidity' | 'sweetness' | 'aftertaste';
 
