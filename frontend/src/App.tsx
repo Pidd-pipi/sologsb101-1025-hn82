@@ -8,6 +8,7 @@ import { App as AntdApp, Badge, Layout, Menu, Space, Spin, Tag, Typography } fro
 import {
   ApiOutlined,
   AreaChartOutlined,
+  ClusterOutlined,
   CoffeeOutlined,
   ExperimentOutlined,
   InboxOutlined,
@@ -30,6 +31,7 @@ const ROUTE_ICONS: Record<string, ReactNode> = {
   [ROUTES.development]: <ApiOutlined />,
   [ROUTES.cuppings]: <ExperimentOutlined />,
   [ROUTES.blends]: <CoffeeOutlined />,
+  [ROUTES.merge]: <ClusterOutlined />,
 };
 
 export default function App() {
@@ -158,7 +160,7 @@ export default function App() {
         </Content>
 
         <Footer style={{ textAlign: 'center', background: 'transparent', color: 'rgba(74,44,23,0.55)' }}>
-          纯前端 SPA · 数据仅保存在本机浏览器 IndexedDB（库名 gbroastlog，结构版本 2）·
+          纯前端 SPA · 数据仅保存在本机浏览器 IndexedDB（库名 gbroastlog，结构版本 3）·
           <Link to={ROUTES.beans} style={{ marginLeft: 6 }}>
             返回生豆档案
           </Link>

@@ -42,7 +42,7 @@ docker compose up -d --build
 | 语言 | TypeScript（`strict`、`noUnusedLocals`、`noUnusedParameters`） | ~5.6.3 |
 | UI 组件 | Ant Design + @ant-design/icons | ^5.22.5 / ^5.5.1 |
 | 构建 | Vite | ^5.4.11 |
-| 状态管理 | Redux Toolkit + React Redux（`configureStore` 汇总 4 个 slice） | ^2.3.0 / ^9.1.2 |
+| 状态管理 | Redux Toolkit + React Redux（`configureStore` 汇总 5 个 slice） | ^2.3.0 / ^9.1.2 |
 | 路由 | React Router（`createBrowserRouter`，页面懒加载） | ^6.28.0 |
 | 本地存储 | Dexie（IndexedDB 封装，含结构版本号与升级迁移） | ^4.0.10 |
 | 日期 | dayjs | ^1.11.13 |
@@ -111,11 +111,15 @@ sologsb101-1025/
         │   ├── CurveEntry.tsx       # /curves
         │   ├── DevelopmentBoard.tsx # /development
         │   ├── CuppingBoard.tsx     # /cuppings
-        │   └── BlendPlan.tsx        # /blends
+        │   ├── BlendPlan.tsx        # /blends
+        │   └── MergeCenter.tsx      # /merge 离线档案逐条合并、冲突裁决与失败重试
         ├── router/index.tsx    # 路由表 + ROUTE_META（导航标题）
         └── utils/
             ├── curve.ts        # 温升插值、发展率、分段 RoR、分档与缺节点检测
-            ├── db.ts           # Dexie 实例、版本迁移、播种、级联删除、扣减、快照导入导出
+            ├── revision.ts     # 修订号：按业务日期回填 / 编辑递增（合并先比它）
+            ├── merge.ts        # 逐条合并引擎：比对裁决、容量闸门、落地重算
+            ├── mergeDraftTransfer.ts # /blends → /merge 待合并档案的会话内传递
+            ├── db.ts           # Dexie 实例、版本迁移、播种、级联删除、扣减、快照导出、合并落地与草稿
             └── export.ts       # 烘焙/杯测/拼配 JSON 导出与结构校验
 ```
 
@@ -129,6 +133,7 @@ sologsb101-1025/
 | `/development` | 发展率与 RoR：按节点算发展时间占比与各段升温速率并给异常提示 | Event、RoastProfile | ScoreTag、FilterBar、StatBadge |
 | `/cuppings` | 杯测评分：五维分项加权总分、分档结论、总分排序 | Cupping、RoastProfile | ScoreTag、EmptyPanel、FilterBar |
 | `/blends` | 拼配方案：占比合计 100% 校验、参与批次杯测均分回显、目标风味登记、JSON 导入导出 | Blend 及全部模型 | FilterBar、StatBadge、EmptyPanel、ScoreTag |
+| `/merge` | 档案合并中心：离线档案逐条合并（修订号/时间比对）、两边都改过的冲突裁决（双候选）、生豆余量容量闸门、失败重试草稿、落地后 RoR/总分/余量重算 | 全部模型 + MergeDraft | Table、Tag、Timeline、Alert、Statistic |
 
 `/` 与任何未知路径都会重定向到第一个模块路径 `/beans`。
 
@@ -137,17 +142,23 @@ sologsb101-1025/
 ## 五、IndexedDB 库名与数据存储说明
 
 - **库名（Dexie 数据库名）**：`gbroastlog`（`src/utils/db.ts` 里的 `DB_NAME`）。
-- **结构版本号**：`DB_VERSION = 2`
+- **结构版本号**：`DB_VERSION = 3`
   - `version(1).stores({...})`：初版结构（生豆 / 烘焙记录 / 曲线事件 / 杯测 / 拼配方案分表存储）。
   - `version(2).stores({...}).upgrade(async (tx) => {...})`：**真实迁移逻辑**——为全部表补齐 `createdAt/updatedAt` 并加索引、新增 `machineTemplates` 载量模板表、按 `profileId` 分组后依时间顺序补算历史事件的 `rorPerMin`、按分项权重补算历史杯测的 `totalScore`、兜底处理法/状态/配方明细数组等字段。
-- **数据表**：`greenBeans`（生豆）、`roastProfiles`（烘焙记录）、`events`（曲线事件）、`cuppings`（杯测）、`blends`（拼配方案）、`machineTemplates`（载量模板）。
+  - `version(3).stores({...}).upgrade(async (tx) => {...})`：离线合并支持——全部表加 **`revision` 修订号索引**，旧数据没有修订号时**按业务日期回填**（生豆按到货日期、烘焙记录按烘焙日期、杯测按杯测日期……日期相对纪元 2000-01-01 的天数），并新增 `mergeDrafts` 表保存「容量不足被拒绝、留待重试」的合并草稿。
+- **数据表**：`greenBeans`（生豆）、`roastProfiles`（烘焙记录）、`events`（曲线事件）、`cuppings`（杯测）、`blends`（拼配方案）、`machineTemplates`（载量模板）、`mergeDrafts`（合并重试草稿）。
+- **修订号机制**：6 张业务表均带 `revision`，每次新建/编辑/状态流转在持久层（`utils/db.ts` 的 `withBumpedRevision`）统一分配——新建按业务日期起算、编辑在原修订号上 +1、跨天自动抬升。合并时同一条先比修订号、再比 `updatedAt`。
+- **逐条离线合并**（`utils/merge.ts` + `/merge` 档案合并中心）：烘焙间与门店各持一份档案离线修改，回店后在 `/merge`（也可由 `/blends` 的「合并档案」入口带入）做整库**逐条合并**——
+  - 同一条：先比修订号再比时间；修订号/时间相同且两边业务内容都改过（派生字段 `stockKg/rorPerMin/totalScore` 不参与比对，它们落地时重算）→ **保留两个候选**人工裁决（留本店 / 留对端 / 两个都留），绝不用后到的盖掉；只有一边有的直接补进来。
+  - **入库前容量闸门**：对端带来的、本店尚未扣减过的「已完成」烘焙记录按 `chargeG` 合计占用在库余量，任一生豆余量不够就**整单拒绝入库**（不写半截数据），整份对端档案落为 `mergeDrafts` 重试草稿（沿用已做的冲突裁决）；补货后在 `/merge` 点「接着草稿重试」，成功后草稿自动清除。
+  - **合并落地后统一重算**：曲线节点的分段 RoR（首点为 0）、杯测五项加权总分、拼配方案参批次均分（由合并后的杯测实时派生）；生豆余量只按本次新采纳的已完成烘焙记录统一扣一遍（本店历史已完成的早已扣过、不采信对端各自扣过的 `stockKg`），避免两边各扣一遍。
 - **首屏自动播种**：`initDatabase()` 在 `db.greenBeans.count() === 0` 时调用 `seedDatabase()`，灌入三层互相引用的演示数据（4 批生豆 → 4 次烘焙记录 → 15 个曲线节点 / 3 笔杯测 → 3 个拼配方案 + 4 个载量模板），固定 id + `bulkPut`，幂等可重复执行。
 - **业务写入规则**：
   - 删除生豆会级联删除其烘焙记录、曲线事件、杯测，并从拼配配方中摘除相关成分；删除烘焙记录同样级联删除事件、杯测并摘除配方成分。
   - 烘焙记录状态流转：记录中 → 已完成 / 作废（已完成可作废，作废可恢复记录中）。
   - **下豆扣减**：记录中状态的烘焙记录标记「已完成」（或录入下豆节点后确认）时，按 `chargeG` 自动扣减对应生豆的 `stockKg`，余量低于 2kg 给出补货提醒；余量不足会被拒绝，且不会重复扣减。
   - `/curves` 拖拽排序（HTML5 原生 `draggable`）会保留原有时间集合、按新顺序重排每个节点的 `atSec` 并 `bulkPut` 写回 Dexie。
-- **导入导出**：`/blends` 支持整库档案 JSON 导出/导入（导入前 `parseArchiveJson` 结构校验，导入会清空当前本地库后写入）与单个方案 JSON 导入（`parseBlendJson` 校验占比必须等于 100%）；`/curves`、`/development`、`/cuppings`、`/beans` 也分别提供曲线档案、杯测档案与整库档案的导出。
+- **导入导出**：`/blends` 支持整库档案 JSON 导出与发起合并（「合并档案」会把对端档案带到 `/merge` 逐条合并，**不再清空覆盖当前本地库**），以及单个方案 JSON 导入（`parseBlendJson` 校验占比必须等于 100%）；`/curves`、`/development`、`/cuppings`、`/beans` 也分别提供曲线档案、杯测档案与整库档案的导出。
 - **容器无状态**：没有后端、没有数据库服务、不挂载命名卷；数据只在访问者浏览器里，换浏览器或清除站点数据即恢复到「空库 + 重新播种」状态。
 
 ---

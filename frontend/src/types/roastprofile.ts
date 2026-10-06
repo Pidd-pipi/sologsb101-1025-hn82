@@ -24,11 +24,13 @@ export interface RoastProfile {
   roastedAt: string;
   /** 状态：记录中 / 已完成 / 作废 */
   state: RoastState;
+  /** 修订号（离线合并先比它；旧数据按烘焙日期回填） */
+  revision: number;
   createdAt: string;
   updatedAt: string;
 }
 
-export type RoastProfileDraft = Omit<RoastProfile, 'id' | 'createdAt' | 'updatedAt'>;
+export type RoastProfileDraft = Omit<RoastProfile, 'id' | 'revision' | 'createdAt' | 'updatedAt'>;
 
 /** 机型 + 风门 + 火力档 + 常用载量模板（/machines 维护，/curves 建单时复用） */
 export interface MachineTemplate {
@@ -43,11 +45,13 @@ export interface MachineTemplate {
   chargeG: number;
   /** 备注：如「满锅」「样品烘焙」 */
   note: string;
+  /** 修订号（离线合并先比它） */
+  revision: number;
   createdAt: string;
   updatedAt: string;
 }
 
-export type MachineTemplateDraft = Omit<MachineTemplate, 'id' | 'createdAt' | 'updatedAt'>;
+export type MachineTemplateDraft = Omit<MachineTemplate, 'id' | 'revision' | 'createdAt' | 'updatedAt'>;
 
 export const AIRFLOW_LABEL: Record<Airflow, string> = {
   closed: '关',

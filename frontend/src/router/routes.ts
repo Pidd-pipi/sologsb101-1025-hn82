@@ -15,6 +15,7 @@ export const ROUTES = {
   development: '/development',
   cuppings: '/cuppings',
   blends: '/blends',
+  merge: '/merge',
 } as const;
 
 export interface RouteMeta {
@@ -31,4 +32,5 @@ export const ROUTE_META: RouteMeta[] = [
   { path: ROUTES.development, title: '发展率与 RoR', description: '发展时间占比、分段升温速率与异常提示' },
   { path: ROUTES.cuppings, title: '杯测评分', description: '分项加权总分、分档结论与总分排序' },
   { path: ROUTES.blends, title: '拼配方案', description: '占比 100% 校验、杯测均分回显与 JSON 导入导出' },
+  { path: ROUTES.merge, title: '档案合并', description: '烘焙间/门店离线档案逐条合并、冲突裁决与失败重试' },
 ];

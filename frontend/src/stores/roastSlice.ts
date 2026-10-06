@@ -95,7 +95,7 @@ export const fetchRoastProfiles = createAsyncThunk('roasts/fetchProfiles', async
 
 export const createRoastProfile = createAsyncThunk('roasts/createProfile', async (draft: RoastProfileDraft) => {
   const stamp = nowIso();
-  const row: RoastProfile = { ...draft, id: createId('rp'), createdAt: stamp, updatedAt: stamp };
+  const row: RoastProfile = { ...draft, id: createId('rp'), revision: 0, createdAt: stamp, updatedAt: stamp };
   await putRoastProfile(row);
   return listRoastProfiles();
 });
@@ -109,6 +109,7 @@ export const updateRoastProfile = createAsyncThunk(
     const row: RoastProfile = {
       ...input.draft,
       id: input.id,
+      revision: existing?.revision ?? 0,
       createdAt: existing ? existing.createdAt : stamp,
       updatedAt: stamp,
     };
@@ -155,6 +156,7 @@ export const saveEvent = createAsyncThunk<EventSaveResult, EventInput>(
     const row: RoastEvent = {
       ...input.draft,
       id: input.id ?? createId('ev'),
+      revision: 0,
       createdAt: input.createdAt ?? stamp,
       updatedAt: stamp,
     };
@@ -198,6 +200,7 @@ export const saveMachineTemplate = createAsyncThunk(
     const row: MachineTemplate = {
       ...input.draft,
       id: input.id ?? createId('mt'),
+      revision: 0,
       createdAt: stamp,
       updatedAt: stamp,
     };

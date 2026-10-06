@@ -20,6 +20,8 @@ export interface Cupping {
   aftertaste: number;
   /** 加权总分 0-100 */
   totalScore: number;
+  /** 修订号（离线合并先比它；旧数据按杯测日期回填） */
+  revision: number;
   createdAt: string;
   updatedAt: string;
 }

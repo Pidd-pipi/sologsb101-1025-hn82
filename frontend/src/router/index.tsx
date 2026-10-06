@@ -19,6 +19,7 @@ const CurveEntry = lazy(() => import('../pages/CurveEntry'));
 const DevelopmentBoard = lazy(() => import('../pages/DevelopmentBoard'));
 const CuppingBoard = lazy(() => import('../pages/CuppingBoard'));
 const BlendPlan = lazy(() => import('../pages/BlendPlan'));
+const MergeCenter = lazy(() => import('../pages/MergeCenter'));
 
 /** 懒加载页面占位 */
 function RouteFallback() {
@@ -42,6 +43,7 @@ export const appRoutes: RouteObject[] = [
       { path: 'development', element: withSuspense(<DevelopmentBoard />) },
       { path: 'cuppings', element: withSuspense(<CuppingBoard />) },
       { path: 'blends', element: withSuspense(<BlendPlan />) },
+      { path: 'merge', element: withSuspense(<MergeCenter />) },
       { path: '*', element: <Navigate to={ROUTES.beans} replace /> },
     ],
   },

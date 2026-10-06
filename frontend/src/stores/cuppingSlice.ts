@@ -95,6 +95,7 @@ export const createCupping = createAsyncThunk('cuppings/create', async (draft: C
     sweetness: normalizePartScore(draft.sweetness),
     aftertaste: normalizePartScore(draft.aftertaste),
     totalScore: weightedTotalScore(draft),
+    revision: 0,
     createdAt: stamp,
     updatedAt: stamp,
   };
@@ -117,6 +118,7 @@ export const updateCupping = createAsyncThunk(
       sweetness: normalizePartScore(input.draft.sweetness),
       aftertaste: normalizePartScore(input.draft.aftertaste),
       totalScore: weightedTotalScore(input.draft),
+      revision: existing?.revision ?? 0,
       createdAt: existing ? existing.createdAt : stamp,
       updatedAt: stamp,
     };

@@ -19,6 +19,8 @@ export interface RoastEvent {
   rorPerMin: number;
   /** 备注 */
   note: string;
+  /** 修订号（离线合并先比它；旧数据按创建时间回填） */
+  revision: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -26,7 +28,7 @@ export interface RoastEvent {
 /** 数据模型别名：Event 曲线事件 */
 export type Event = RoastEvent;
 
-export type RoastEventDraft = Omit<RoastEvent, 'id' | 'createdAt' | 'updatedAt'>;
+export type RoastEventDraft = Omit<RoastEvent, 'id' | 'revision' | 'createdAt' | 'updatedAt'>;
 
 export const EVENT_TYPE_LABEL: Record<RoastEventType, string> = {
   turning: '回温',

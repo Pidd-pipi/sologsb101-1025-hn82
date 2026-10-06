@@ -35,6 +35,7 @@ import {
   SwapOutlined,
 } from '@ant-design/icons';
 import dayjs, { type Dayjs } from 'dayjs';
+import { useNavigate } from 'react-router-dom';
 import FilterBar, { type FilterSelectConfig } from '../components/common/FilterBar';
 import EmptyPanel from '../components/common/EmptyPanel';
 import ScoreTag from '../components/common/ScoreTag';
@@ -91,7 +92,9 @@ import {
   parseArchiveJson,
   parseBlendJson,
 } from '../utils/export';
-import { exportSnapshot, importSnapshot } from '../utils/db';
+import { exportSnapshot } from '../utils/db';
+import { ROUTES } from '../router/routes';
+import { savePendingIncoming } from '../utils/mergeDraftTransfer';
 import type { Blend } from '../types/blend';
 
 interface BlendFormValues {
@@ -106,6 +109,7 @@ type ImportMode = 'blend' | 'archive';
 
 export default function BlendPlan() {
   const dispatch = useAppDispatch();
+  const navigate = useNavigate();
   const { message, modal } = AntdApp.useApp();
   const [form] = Form.useForm<BlendFormValues>();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -338,20 +342,13 @@ export default function BlendPlan() {
       try {
         const snapshot = parseArchiveJson(text);
         modal.confirm({
-          title: '导入整库档案并覆盖现有数据？',
-          content: `档案包含：生豆 ${snapshot.greenBeans.length} 批 / 烘焙记录 ${snapshot.roastProfiles.length} 次 / 曲线事件 ${snapshot.events.length} 个 / 杯测 ${snapshot.cuppings.length} 笔 / 拼配 ${snapshot.blends.length} 个。导入会先清空当前本地库。`,
-          okText: '覆盖导入',
-          okButtonProps: { danger: true },
+          title: '把这份档案带去合并中心逐条合并？',
+          content: `档案包含：生豆 ${snapshot.greenBeans.length} 批 / 烘焙记录 ${snapshot.roastProfiles.length} 次 / 曲线事件 ${snapshot.events.length} 个 / 杯测 ${snapshot.cuppings.length} 笔 / 拼配 ${snapshot.blends.length} 个。系统会先比修订号与时间、检查生豆余量，不会直接覆盖当前数据。`,
+          okText: '去逐条合并',
           cancelText: '取消',
-          async onOk() {
-            await importSnapshot(snapshot);
-            await Promise.all([
-              dispatch(fetchBlends()).unwrap(),
-              dispatch(fetchGreenBeans()).unwrap(),
-              dispatch(fetchRoastProfiles()).unwrap(),
-              dispatch(fetchCuppings()).unwrap(),
-            ]);
-            message.success('整库档案已导入');
+          onOk() {
+            savePendingIncoming(snapshot);
+            navigate(ROUTES.merge);
           },
         });
       } catch (error) {
@@ -526,7 +523,7 @@ export default function BlendPlan() {
               导出档案
             </Button>
             <Button icon={<ImportOutlined />} onClick={() => triggerImport('archive')}>
-              导入档案
+              合并档案
             </Button>
             <Button icon={<ImportOutlined />} onClick={() => triggerImport('blend')}>
               导入方案

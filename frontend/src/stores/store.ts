@@ -8,6 +8,7 @@ import beanReducer, { fetchGreenBeans } from './beanSlice';
 import roastReducer, { fetchMachineTemplates, fetchRoastProfiles } from './roastSlice';
 import cuppingReducer, { fetchCuppings } from './cuppingSlice';
 import blendReducer, { fetchBlends } from './blendSlice';
+import mergeReducer from './mergeSlice';
 import { initDatabase } from '../utils/db';
 
 export const store = configureStore({
@@ -16,6 +17,7 @@ export const store = configureStore({
     roasts: roastReducer,
     cuppings: cuppingReducer,
     blends: blendReducer,
+    merge: mergeReducer,
   },
 });
 

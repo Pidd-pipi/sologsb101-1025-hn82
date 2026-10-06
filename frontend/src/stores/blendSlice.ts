@@ -85,6 +85,7 @@ export const createBlend = createAsyncThunk('blends/create', async (draft: Blend
     targetFlavor: joinFlavors(draft.targetFlavor),
     createdAt: draft.createdAt,
     state: draft.state,
+    revision: 0,
     updatedAt: stamp,
   };
   await putBlend(row);
@@ -95,6 +96,8 @@ export const updateBlend = createAsyncThunk(
   'blends/update',
   async (input: { id: string; draft: BlendDraftState }) => {
     const stamp = nowIso();
+    const existingAll = await listBlends();
+    const existingRow = existingAll.find((blend) => blend.id === input.id);
     const row: Blend = {
       id: input.id,
       name: input.draft.name.trim(),
@@ -102,6 +105,7 @@ export const updateBlend = createAsyncThunk(
       targetFlavor: joinFlavors(input.draft.targetFlavor),
       createdAt: input.draft.createdAt,
       state: input.draft.state,
+      revision: existingRow?.revision ?? 0,
       updatedAt: stamp,
     };
     await putBlend(row);
@@ -119,7 +123,7 @@ export const advanceBlendState = createAsyncThunk(
   async (input: { id: string; state: BlendState }) => {
     const existing = (await listBlends()).find((blend) => blend.id === input.id);
     if (existing) {
-      await putBlend({ ...existing, state: input.state, updatedAt: nowIso() });
+      await putBlend({ ...existing, state: input.state, revision: existing.revision });
     }
     return listBlends();
   },
@@ -128,7 +132,7 @@ export const advanceBlendState = createAsyncThunk(
 /** 导入单个方案 JSON（已通过 parseBlendJson 校验） */
 export const importBlendDraft = createAsyncThunk('blends/import', async (draft: BlendDraft) => {
   const stamp = nowIso();
-  const row: Blend = { ...draft, id: createId('bl'), updatedAt: stamp };
+  const row: Blend = { ...draft, id: createId('bl'), revision: 0, updatedAt: stamp };
   await putBlend(row);
   return listBlends();
 });

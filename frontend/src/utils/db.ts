@@ -1,9 +1,10 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据库名 gbroastlog，数据结构版本号 DB_VERSION = 2（version(1) 初版 + version(2) 真实迁移）
- * - 生豆 / 烘焙记录 / 曲线事件 / 杯测 / 拼配方案 分表存储（另有载量模板表）
+ * - 数据库名 gbroastlog，数据结构版本号 DB_VERSION = 3
+ *   （v1 初版 / v2 补 createdAt·updatedAt 与载量模板并补算 RoR·总分 / v3 加修订号 revision 与 mergeDrafts 重试草稿表）
+ * - 生豆 / 烘焙记录 / 曲线事件 / 杯测 / 拼配方案 分表存储（另有载量模板表、合并草稿表）
  * - 首屏自动播种演示数据（父→子→孙三层贯通，幂等）
- * - 整库快照导出导入、级联删除、下豆扣减生豆在库重量
+ * - 整库快照导出、逐条合并落地、合并重试草稿、级联删除、下豆扣减生豆在库重量
  * 纯前端应用：不依赖任何后端或数据库服务。
  */
 import Dexie, { type Table } from 'dexie';
@@ -16,12 +17,25 @@ import type { Cupping } from '../types/cupping';
 import { weightedTotalScore } from '../types/cupping';
 import type { Blend } from '../types/blend';
 import { rorPerMinBetween } from './curve';
+import { nextRevision, revisionFromDate } from './revision';
+import type { MergeDraft, MergedSnapshot } from './merge';
+import { buildMergedSnapshot, type MergeReport } from './merge';
 
 /** 数据库名（= 项目英文短名） */
 export const DB_NAME = 'gbroastlog';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
+
+/** 各业务表修订号回填/递增时参考的业务日期字段 */
+const REVISION_DATE_FIELD: Record<string, string> = {
+  greenBeans: 'arrivedAt',
+  roastProfiles: 'roastedAt',
+  events: 'createdAt',
+  cuppings: 'cuppedAt',
+  blends: 'createdAt',
+  machineTemplates: 'createdAt',
+};
 
 class RoastLogDatabase extends Dexie {
   greenBeans!: Table<GreenBean, string>;
@@ -30,6 +44,8 @@ class RoastLogDatabase extends Dexie {
   cuppings!: Table<Cupping, string>;
   blends!: Table<Blend, string>;
   machineTemplates!: Table<MachineTemplate, string>;
+  /** 容量不足被拒绝、留待重试的合并草稿 */
+  mergeDrafts!: Table<MergeDraft, string>;
 
   constructor() {
     super(DB_NAME);
@@ -44,7 +60,7 @@ class RoastLogDatabase extends Dexie {
     });
 
     // v2：补齐 createdAt/updatedAt 索引；新增载量模板表；按时间顺序补算历史 RoR 与杯测总分
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         greenBeans: 'id, origin, process, arrivedAt, createdAt, updatedAt',
         roastProfiles: 'id, greenBeanId, machineModel, roastedAt, state, updatedAt',
@@ -136,6 +152,35 @@ class RoastLogDatabase extends Dexie {
           if (typeof row.targetFlavor !== 'string') row.targetFlavor = '';
         });
       });
+
+    // v3：离线合并支持——全部表补 revision（旧数据按业务日期回填）；新增 mergeDrafts 重试草稿表
+    this.version(DB_VERSION)
+      .stores({
+        greenBeans: 'id, origin, process, arrivedAt, revision, createdAt, updatedAt',
+        roastProfiles: 'id, greenBeanId, machineModel, roastedAt, state, revision, updatedAt',
+        events: 'id, profileId, type, atSec, revision, createdAt, updatedAt',
+        cuppings: 'id, profileId, cuppedAt, totalScore, revision, updatedAt',
+        blends: 'id, name, state, createdAt, revision, updatedAt',
+        machineTemplates: 'id, model, chargeG, gasLevel, revision',
+        mergeDrafts: 'id, createdAt, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // 旧数据没有修订号：按各自业务日期回填后再参与合并
+        for (const [tableName, dateField] of Object.entries(REVISION_DATE_FIELD)) {
+          await tx
+            .table(tableName)
+            .toCollection()
+            .modify((row: Record<string, unknown>) => {
+              const current = Number(row.revision);
+              if (!Number.isFinite(current) || current <= 0) {
+                const dateText = typeof row[dateField] === 'string' ? String(row[dateField]) : '';
+                row.revision = revisionFromDate(dateText || (typeof row.updatedAt === 'string' ? row.updatedAt : ''));
+              } else {
+                row.revision = Math.trunc(current);
+              }
+            });
+        }
+      });
   }
 }
 
@@ -158,6 +203,26 @@ export function roundKg(value: number): number {
   return Math.round(value * 1000) / 1000;
 }
 
+/** 取某表一行的业务日期（修订号按它回填/递增） */
+function businessDateOf(tableName: keyof typeof REVISION_DATE_FIELD, row: Record<string, unknown>): string {
+  const field = REVISION_DATE_FIELD[tableName];
+  const value = row[field];
+  return typeof value === 'string' && value ? value : new Date().toISOString().slice(0, 10);
+}
+
+/** 写入前统一分配修订号：已存在则在原修订号上 +1，新记录按业务日期起算 */
+async function withBumpedRevision<T extends { id: string; revision?: number }>(
+  table: Table<T, string>,
+  tableName: keyof typeof REVISION_DATE_FIELD,
+  row: T,
+): Promise<T & { revision: number }> {
+  const existing = await table.get(row.id);
+  return {
+    ...row,
+    revision: nextRevision(existing?.revision, businessDateOf(tableName, row as Record<string, unknown>)),
+  };
+}
+
 /* --------------------------- 生豆 GreenBean --------------------------- */
 
 export async function listGreenBeans(): Promise<GreenBean[]> {
@@ -169,8 +234,9 @@ export async function getGreenBean(id: string): Promise<GreenBean | undefined> {
   return db.greenBeans.get(id);
 }
 
-export async function putGreenBean(row: GreenBean): Promise<void> {
-  await db.greenBeans.put(row);
+/** 写入生豆（修订号由持久层统一分配：新建按到货日期起算，编辑在原值上 +1） */
+export async function putGreenBean(row: Omit<GreenBean, 'revision'> & { revision?: number }): Promise<void> {
+  await db.greenBeans.put(await withBumpedRevision(db.greenBeans, 'greenBeans', row));
 }
 
 /** 删除生豆：级联删除其烘焙记录、曲线事件、杯测，并从拼配配方中摘除相关成分 */
@@ -207,8 +273,9 @@ export async function getRoastProfile(id: string): Promise<RoastProfile | undefi
   return db.roastProfiles.get(id);
 }
 
-export async function putRoastProfile(row: RoastProfile): Promise<void> {
-  await db.roastProfiles.put(row);
+/** 写入烘焙记录（修订号由持久层按烘焙日期统一分配/递增） */
+export async function putRoastProfile(row: Omit<RoastProfile, 'revision'> & { revision?: number }): Promise<void> {
+  await db.roastProfiles.put(await withBumpedRevision(db.roastProfiles, 'roastProfiles', row));
 }
 
 /** 删除烘焙记录：级联删除曲线事件与杯测，并从拼配配方中摘除相关成分 */
@@ -229,9 +296,17 @@ export async function removeRoastProfile(id: string): Promise<void> {
   });
 }
 
-/** 状态流转：记录中 → 已完成 / 作废 */
+/** 状态流转：记录中 → 已完成 / 作废（流转也产生一次修订） */
 export async function updateRoastState(id: string, state: RoastState): Promise<void> {
-  await db.roastProfiles.update(id, { state, updatedAt: nowIso() });
+  const existing = await db.roastProfiles.get(id);
+  if (!existing) return;
+  const stamp = nowIso();
+  await db.roastProfiles.put({
+    ...existing,
+    state,
+    updatedAt: stamp,
+    revision: nextRevision(existing.revision, existing.roastedAt),
+  });
 }
 
 /* --------------------------- 曲线事件 RoastEvent --------------------------- */
@@ -247,12 +322,19 @@ export async function listAllEvents(): Promise<RoastEvent[]> {
   return db.events.toArray();
 }
 
-export async function putEvent(row: RoastEvent): Promise<void> {
-  await db.events.put(row);
+export async function getEvent(id: string): Promise<RoastEvent | undefined> {
+  return db.events.get(id);
 }
 
-export async function putEvents(rows: RoastEvent[]): Promise<void> {
-  await db.events.bulkPut(rows);
+/** 写入单个曲线节点（修订号由持久层统一分配/递增） */
+export async function putEvent(row: Omit<RoastEvent, 'revision'> & { revision?: number }): Promise<void> {
+  await db.events.put(await withBumpedRevision(db.events, 'events', row));
+}
+
+/** 批量写入曲线节点：已存在按原修订号 +1，新节点按创建时间起算 */
+export async function putEvents(rows: Array<Omit<RoastEvent, 'revision'> & { revision?: number }>): Promise<void> {
+  const next = await Promise.all(rows.map((row) => withBumpedRevision(db.events, 'events', row)));
+  await db.events.bulkPut(next);
 }
 
 export async function removeEvent(id: string): Promise<void> {
@@ -266,8 +348,9 @@ export async function listCuppings(): Promise<Cupping[]> {
   return rows.sort((a, b) => b.cuppedAt.localeCompare(a.cuppedAt));
 }
 
-export async function putCupping(row: Cupping): Promise<void> {
-  await db.cuppings.put(row);
+/** 写入杯测（修订号由持久层按杯测日期统一分配/递增；总分由分项重算） */
+export async function putCupping(row: Omit<Cupping, 'revision'> & { revision?: number }): Promise<void> {
+  await db.cuppings.put(await withBumpedRevision(db.cuppings, 'cuppings', row));
 }
 
 export async function removeCupping(id: string): Promise<void> {
@@ -281,8 +364,9 @@ export async function listBlends(): Promise<Blend[]> {
   return rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
-export async function putBlend(row: Blend): Promise<void> {
-  await db.blends.put(row);
+/** 写入拼配方案（修订号由持久层按创建日期统一分配/递增） */
+export async function putBlend(row: Omit<Blend, 'revision'> & { revision?: number }): Promise<void> {
+  await db.blends.put(await withBumpedRevision(db.blends, 'blends', row));
 }
 
 export async function removeBlend(id: string): Promise<void> {
@@ -296,8 +380,11 @@ export async function listMachineTemplates(): Promise<MachineTemplate[]> {
   return rows.sort((a, b) => a.model.localeCompare(b.model, 'zh-Hans-CN') || a.chargeG - b.chargeG);
 }
 
-export async function putMachineTemplate(row: MachineTemplate): Promise<void> {
-  await db.machineTemplates.put(row);
+/** 写入载量模板（修订号由持久层统一分配/递增） */
+export async function putMachineTemplate(
+  row: Omit<MachineTemplate, 'revision'> & { revision?: number },
+): Promise<void> {
+  await db.machineTemplates.put(await withBumpedRevision(db.machineTemplates, 'machineTemplates', row));
 }
 
 export async function removeMachineTemplate(id: string): Promise<void> {
@@ -358,8 +445,18 @@ export async function consumeStockForProfile(profileId: string): Promise<StockCo
     }
     const stamp = nowIso();
     const remainingKg = roundKg(bean.stockKg - deductedKg);
-    const nextBean: GreenBean = { ...bean, stockKg: remainingKg, updatedAt: stamp };
-    const nextProfile: RoastProfile = { ...profile, state: 'done', updatedAt: stamp };
+    const nextBean: GreenBean = {
+      ...bean,
+      stockKg: remainingKg,
+      revision: nextRevision(bean.revision, bean.arrivedAt),
+      updatedAt: stamp,
+    };
+    const nextProfile: RoastProfile = {
+      ...profile,
+      state: 'done',
+      revision: nextRevision(profile.revision, profile.roastedAt),
+      updatedAt: stamp,
+    };
     await db.greenBeans.put(nextBean);
     await db.roastProfiles.put(nextProfile);
     const warning = remainingKg < LOW_STOCK_KG;
@@ -427,11 +524,14 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
   };
 }
 
-/** 用快照覆盖整库（导入档案） */
-export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  if (!isDatabaseSnapshot(snapshot)) {
-    throw new Error('档案结构不合法：缺少 greenBeans / roastProfiles / events / cuppings / blends 数组字段');
-  }
+/**
+ * 按预演报告把两份离线档案合并落地（逐条合并的最终写入）。
+ * - 未裁决冲突 / 容量不足：buildMergedSnapshot 会直接抛 MergeBlockedError，整单不写；
+ * - 六张业务表在同一事务内整体替换为合并结果，保证「要么合并成功，要么原样不动」；
+ * - 曲线分段 RoR、杯测总分、生豆余量已在构建阶段统一重算。
+ */
+export async function commitMergedSnapshot(report: MergeReport): Promise<void> {
+  const merged: MergedSnapshot = buildMergedSnapshot(report);
   await db.transaction(
     'rw',
     [db.greenBeans, db.roastProfiles, db.events, db.cuppings, db.blends, db.machineTemplates],
@@ -444,14 +544,35 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.blends.clear(),
         db.machineTemplates.clear(),
       ]);
-      await db.greenBeans.bulkPut(snapshot.greenBeans);
-      await db.roastProfiles.bulkPut(snapshot.roastProfiles);
-      await db.events.bulkPut(snapshot.events);
-      await db.cuppings.bulkPut(snapshot.cuppings);
-      await db.blends.bulkPut(snapshot.blends);
-      await db.machineTemplates.bulkPut(snapshot.machineTemplates ?? []);
+      await db.greenBeans.bulkPut(merged.greenBeans);
+      await db.roastProfiles.bulkPut(merged.roastProfiles);
+      await db.events.bulkPut(merged.events);
+      await db.cuppings.bulkPut(merged.cuppings);
+      await db.blends.bulkPut(merged.blends);
+      await db.machineTemplates.bulkPut(merged.machineTemplates);
     },
   );
+}
+
+/* --------------------------- 合并重试草稿 mergeDrafts --------------------------- */
+
+/** 列出全部「容量不足待重试」的合并草稿（新的在前） */
+export async function listMergeDrafts(): Promise<MergeDraft[]> {
+  const rows = await db.mergeDrafts.toArray();
+  return rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+/** 保存 / 更新合并重试草稿 */
+export async function putMergeDraft(draft: MergeDraft): Promise<void> {
+  await db.mergeDrafts.put(draft);
+}
+
+export async function getMergeDraft(id: string): Promise<MergeDraft | undefined> {
+  return db.mergeDrafts.get(id);
+}
+
+export async function removeMergeDraft(id: string): Promise<void> {
+  await db.mergeDrafts.delete(id);
 }
 
 /** 清空全部表 */
@@ -526,6 +647,7 @@ export async function seedDatabase(): Promise<void> {
       moisturePct: 10.8,
       stockKg: 12.5,
       arrivedAt: day(-52),
+      revision: nextRevision(undefined, day(0)),
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -538,6 +660,7 @@ export async function seedDatabase(): Promise<void> {
       moisturePct: 11.2,
       stockKg: 1.4,
       arrivedAt: day(-38),
+      revision: nextRevision(undefined, day(0)),
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -550,6 +673,7 @@ export async function seedDatabase(): Promise<void> {
       moisturePct: 11.6,
       stockKg: 20,
       arrivedAt: day(-22),
+      revision: nextRevision(undefined, day(0)),
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -562,6 +686,7 @@ export async function seedDatabase(): Promise<void> {
       moisturePct: 10.4,
       stockKg: 6.4,
       arrivedAt: day(-10),
+      revision: nextRevision(undefined, day(0)),
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -578,6 +703,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 4,
       roastedAt: day(2),
       state: 'done',
+      revision: nextRevision(undefined, day(0)),
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -591,6 +717,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 5,
       roastedAt: day(6),
       state: 'recording',
+      revision: nextRevision(undefined, day(0)),
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -604,6 +731,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 6,
       roastedAt: day(10),
       state: 'done',
+      revision: nextRevision(undefined, day(0)),
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -617,6 +745,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 3,
       roastedAt: day(12),
       state: 'void',
+      revision: nextRevision(undefined, day(0)),
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -648,6 +777,7 @@ export async function seedDatabase(): Promise<void> {
     beanTempC,
     rorPerMin: 0,
     note,
+    revision: revisionFromDate(stamp.slice(0, 10)),
     createdAt: stamp,
     updatedAt: stamp,
   }));
@@ -687,6 +817,7 @@ export async function seedDatabase(): Promise<void> {
     sweetness,
     aftertaste,
     totalScore: weightedTotalScore({ dryAroma, wetAroma, acidity, sweetness, aftertaste }),
+    revision: revisionFromDate(cuppedAt),
     createdAt: stamp,
     updatedAt: stamp,
   });
@@ -707,6 +838,7 @@ export async function seedDatabase(): Promise<void> {
         { greenBeanId: 'gb-huila-honey', profileId: 'rp-huila-800', ratioPct: 15 },
       ],
       targetFlavor: '柑橘果酸、坚果可可',
+      revision: revisionFromDate(day(15)),
       createdAt: day(15),
       state: 'final',
       updatedAt: stamp,
@@ -719,6 +851,7 @@ export async function seedDatabase(): Promise<void> {
         { greenBeanId: 'gb-nyeri-washed', profileId: 'rp-nyeri-400', ratioPct: 30 },
       ],
       targetFlavor: '坚果可可、焦糖甜感',
+      revision: revisionFromDate(day(23)),
       createdAt: day(23),
       state: 'trial',
       updatedAt: stamp,
@@ -731,6 +864,7 @@ export async function seedDatabase(): Promise<void> {
         { greenBeanId: 'gb-huila-honey', profileId: 'rp-huila-800', ratioPct: 30 },
       ],
       targetFlavor: '花香、莓果',
+      revision: revisionFromDate(day(27)),
       createdAt: day(27),
       state: 'trial',
       updatedAt: stamp,
@@ -745,6 +879,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 4,
       chargeG: 500,
       note: '常规出品载量',
+      revision: nextRevision(undefined, day(0)),
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -755,6 +890,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 5,
       chargeG: 800,
       note: '满锅载量，适合日晒豆',
+      revision: nextRevision(undefined, day(0)),
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -765,6 +901,7 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 6,
       chargeG: 1200,
       note: '批量生产档',
+      revision: nextRevision(undefined, day(0)),
       createdAt: stamp,
       updatedAt: stamp,
     },
@@ -775,10 +912,25 @@ export async function seedDatabase(): Promise<void> {
       gasLevel: 3,
       chargeG: 400,
       note: '样品烘焙，风门关',
+      revision: nextRevision(undefined, day(0)),
       createdAt: stamp,
       updatedAt: stamp,
     },
   ];
+
+  // 修订号按各自业务日期对齐（旧数据回填口径一致：日期相对纪元的天数）
+  greenBeans.forEach((bean) => {
+    bean.revision = revisionFromDate(bean.arrivedAt);
+  });
+  roastProfiles.forEach((profile) => {
+    profile.revision = revisionFromDate(profile.roastedAt);
+  });
+  blends.forEach((blend) => {
+    blend.revision = revisionFromDate(blend.createdAt);
+  });
+  machineTemplates.forEach((template) => {
+    template.revision = revisionFromDate(stamp.slice(0, 10));
+  });
 
   await db.transaction(
     'rw',

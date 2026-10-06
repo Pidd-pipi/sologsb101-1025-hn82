@@ -55,7 +55,7 @@ export const fetchGreenBeans = createAsyncThunk('beans/fetchAll', async () => li
 
 export const createGreenBean = createAsyncThunk('beans/create', async (draft: GreenBeanDraft) => {
   const stamp = nowIso();
-  const row: GreenBean = { ...draft, id: createId('gb'), createdAt: stamp, updatedAt: stamp };
+  const row: GreenBean = { ...draft, id: createId('gb'), revision: 0, createdAt: stamp, updatedAt: stamp };
   await putGreenBean(row);
   return listGreenBeans();
 });
@@ -64,9 +64,15 @@ export const updateGreenBean = createAsyncThunk(
   'beans/update',
   async (input: { id: string; draft: GreenBeanDraft }) => {
     const stamp = nowIso();
-    const row: GreenBean = { ...input.draft, id: input.id, createdAt: stamp, updatedAt: stamp };
     const existing = (await listGreenBeans()).find((bean) => bean.id === input.id);
-    await putGreenBean({ ...row, createdAt: existing ? existing.createdAt : stamp });
+    const row: GreenBean = {
+      ...input.draft,
+      id: input.id,
+      revision: existing?.revision ?? 0,
+      createdAt: existing ? existing.createdAt : stamp,
+      updatedAt: stamp,
+    };
+    await putGreenBean(row);
     return listGreenBeans();
   },
 );
